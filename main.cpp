@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <iostream>
 #include <optional>
+#include <seastar/core/file-types.hh>
 #include <unordered_map>
 
 #include <seastar/core/aligned_buffer.hh>
@@ -15,13 +16,18 @@
 #include <seastar/core/io_intent.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/seastar.hh>
+#include <seastar/core/sleep.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/core/temporary_buffer.hh>
+#include <seastar/coroutine/all.hh>
+#include <seastar/coroutine/parallel_for_each.hh>
+#include <seastar/util/closeable.hh>
 #include <seastar/util/log.hh>
 #include <seastar/util/tmp_file.hh>
 #include <sys/types.h>
 
-seastar::logger ksea_logger("ksea");
+using namespace seastar;
+logger ksea_logger("ksea");
 
 constexpr int64_t PAGE_SIZE = 4096;
 constexpr int64_t PAGE_HEAD_SIZE = 64;
@@ -202,22 +208,17 @@ private:
   PageHeader header;
   PageEntry entries[4];
 };
-
 class Worker {
 public:
-  Worker() { _open_file(); }
-
-  ~Worker() {
-    std::cout << "Closing file..." << std::endl;
-    _close_file();
-    std::cout << "File closed successfully." << std::endl;
-  }
+  Worker() = default;
+  future<> init() { _file = co_await _open_file(); }
+  future<> close() { co_await _close_file(); }
 
   seastar::future<std::optional<std::string>> get(const std::string &key) {
     if (auto it = _key_to_page_index.find(key);
         it != _key_to_page_index.end()) {
       auto [page_number, entry_index] = it->second;
-      Page page = _read_page_from_file(page_number);
+      Page page = co_await _read_page_from_file(page_number);
 
       if (!page.validate_crc()) {
         ksea_logger.error("Page validate CRC failed for page number");
@@ -233,17 +234,17 @@ public:
   }
 
   seastar::future<bool> add(const std::string &key, const std::string &value) {
-    int64_t allocated_entry_index = _allocate_new_page();
+    int64_t allocated_entry_index = co_await _allocate_new_page();
     if (allocated_entry_index == -1) {
       co_return false;
     }
 
-    Page page = _read_page_from_file(_page_number);
+    Page page = co_await _read_page_from_file(_page_number);
     if (!page.add_entry(key, value, allocated_entry_index)) {
       co_return false;
     }
 
-    _write_page_to_file(page);
+    co_await _write_page_to_file(page);
 
     ksea_logger.debug("Put key {} to page {} index {}", key, _page_number,
                       allocated_entry_index);
@@ -256,7 +257,7 @@ public:
     if (auto it = _key_to_page_index.find(key);
         it != _key_to_page_index.end()) {
       auto [page_number, entry_index] = it->second;
-      Page page = _read_page_from_file(page_number);
+      Page page = co_await _read_page_from_file(page_number);
 
       if (!page.add_entry(key, new_value, entry_index)) {
         std::cerr << "Failed to update entry in page " << page_number
@@ -264,78 +265,66 @@ public:
         co_return false;
       }
 
-      _write_page_to_file(page);
+      co_await _write_page_to_file(page);
       co_return true;
     } else {
       co_return false;
     }
   }
 
+  seastar::future<bool> put(const std::string &key, const std::string &value) {
+    co_return co_await add(key, value);
+  }
+
 private:
-  void _open_file() {
-    _fd = open("page_data.bin", O_RDWR | O_CREAT | O_DIRECT, S_IRUSR | S_IWUSR);
-    if (_fd == -1) {
-      ksea_logger.error("Failed to open file for reading and writing.");
-      throw std::runtime_error("Failed to open file for reading and writing.");
-    }
-    ksea_logger.info("Open file success!");
+  future<file> _open_file() {
+    co_return co_await open_file_dma("page_data.bin",
+                                     open_flags::rw | open_flags::create);
   }
 
-  void _close_file() {
-    if (_fd != -1) {
-      close(_fd);
-    }
-  }
+  future<> _close_file() { co_await _file.close(); }
 
-  Page _read_page_from_file(int64_t page_number) {
+  future<Page> _read_page_from_file(int64_t page_number) {
     Page page(page_number);
-    ssize_t bytes_read = pread(_fd, reinterpret_cast<char *>(&page),
-                               sizeof(Page), page_number * PAGE_SIZE);
+    ksea_logger.debug("pre read");
+    auto bytes_read = co_await _file.dma_read(
+        page_number * PAGE_SIZE, reinterpret_cast<char *>(&page), PAGE_SIZE);
     if (bytes_read != sizeof(Page)) {
-      // Handle error: could not read entire page
       ksea_logger.error("Error reading page from file");
-      // You might want to throw an exception or return an error value here
     }
-    return page;
+    co_return page;
   }
 
-  void _write_page_to_file(const Page &page) {
-    ssize_t bytes_written =
-        pwrite(_fd, reinterpret_cast<const char *>(&page), sizeof(Page),
-               page.get_page_number() * PAGE_SIZE);
-    if (bytes_written != sizeof(Page)) {
-      // Handle error: could not write entire page
+  future<> _write_page_to_file(const Page &page) {
+    int64_t pos = page.get_page_number() * PAGE_SIZE;
+    const char *buffer = reinterpret_cast<const char *>(&page);
+    size_t bytes_written = co_await _file.dma_write(pos, buffer, PAGE_SIZE);
+    if (bytes_written != PAGE_SIZE) {
       ksea_logger.error("Error writing page to file");
-      // You might want to throw an exception or return an error value here
     }
+    ksea_logger.debug("Write pos:{} done", pos);
   }
 
-  int64_t _allocate_new_page() {
+  future<int64_t> _allocate_new_page() {
     if (_entry_index < 4) {
       auto result = _entry_index;
       _entry_index++;
-      return result;
+      co_return result;
     } else {
       _page_number++;
-      _entry_index = 0;
+      _entry_index = 1;
 
-      // Increase file size by one page and fill with zeros
       Page page(_page_number);
-      ssize_t bytes_written = pwrite(_fd, reinterpret_cast<const char *>(&page),
-                                     PAGE_SIZE, _page_number * PAGE_SIZE);
-      if (bytes_written != PAGE_SIZE) {
-        ksea_logger.error("Error expanding file size with zeros");
-        throw std::runtime_error("Error expanding file size with zeros");
-      }
+      co_await _write_page_to_file(page);
 
-      return 0;
+      co_return 0;
     }
   }
 
-  int _fd = -1;
+  seastar::file _file;
   std::unordered_map<std::string, std::pair<int64_t, int64_t>>
       _key_to_page_index;
-  int64_t _page_number = 0;
+  int64_t _page_number = -1;
   int64_t _entry_index = 4;
 };
 
@@ -343,10 +332,51 @@ static_assert(sizeof(PageHeader) == 64, "Page Header size must be 100");
 static_assert(sizeof(PageEntry) == PAGE_ENTRY_SIZE, "Page entry must");
 static_assert(sizeof(Page) <= 4096, "Page size must be 4KB");
 
+class KVService {
+public:
+  KVService(Worker worker) : _worker(worker) {}
+
+  seastar::future<bool> put(const std::string &key, const std::string &value) {
+    co_return co_await _worker.put(key, value);
+  }
+
+  seastar::future<std::optional<std::string>> get(const std::string &key) {
+    co_return co_await _worker.get(key);
+  }
+
+private:
+  Worker _worker;
+};
+seastar::future<int64_t> read_workload(
+    Worker &worker,
+    const std::chrono::high_resolution_clock::time_point &start_time) {
+  int64_t query_count = 0; // Initialize query_count
+  int random_key = rand() % 999 + 1;
+  std::string key = "key" + std::to_string(random_key);
+  while (true) {
+    auto result = co_await worker.get(key);
+    assert(result.has_value());
+    query_count++;
+
+    // Check time every 100 queries
+    if (query_count % 100 == 0) {
+      auto current_time = std::chrono::high_resolution_clock::now();
+      auto duration = std::chrono::duration_cast<std::chrono::seconds>(
+                          current_time - start_time)
+                          .count();
+      if (duration >= 20) {
+        break;
+      }
+    }
+  }
+  co_return query_count;
+}
+
 int main(int argc, char **argv) {
   seastar::app_template app;
   app.run(argc, argv, []() -> seastar::future<> {
     Worker worker;
+    co_await worker.init();
     std::string value = "hello worrld";
 
     // Add 1000 key-value pairs
@@ -356,27 +386,23 @@ int main(int argc, char **argv) {
       assert(add_done);
     }
 
-    // Run for 5 seconds, continuously getting data and counting QPS
-    auto start_time = std::chrono::high_resolution_clock::now();
-    int64_t query_count = 0;
-
-    while (true) {
-      for (int i = 0; i < 1000; ++i) {
-        std::string key = "key" + std::to_string(i);
-        auto result = co_await worker.get(key);
-        assert(result.has_value());
-        query_count++;
-      }
-
-      auto current_time = std::chrono::high_resolution_clock::now();
-      auto duration = std::chrono::duration_cast<std::chrono::seconds>(
-                          current_time - start_time)
-                          .count();
-      if (duration >= 5) {
-        break;
-      }
+    std::vector<int> coroutines;
+    for (int i = 0; i < 1000; ++i) {
+      coroutines.push_back(i);
     }
+    int64_t query_count = 0;
+    auto start_time = std::chrono::high_resolution_clock::now();
+    co_await coroutine::parallel_for_each(coroutines, [&](int i) -> future<> {
+      auto read_qps = co_await read_workload(worker, start_time);
+      query_count += read_qps;
+    });
 
-    std::cout << "Queries per second (QPS): " << query_count / 5 << std::endl;
+    auto current_time = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::seconds>(
+                        current_time - start_time)
+                        .count();
+    std::cout << "pass seconds: " << duration << std::endl;
+    std::cout << "Queries per second (QPS): " << query_count / 20 << std::endl;
+    co_await worker.close();
   });
 }
