@@ -12,5 +12,5 @@ find_package (Seastar REQUIRED)
 include_directories(${PROJECT_SOURCE_DIR}/src/include)
 
 # 添加可执行目标，并指定 Release 模式
-add_executable(my_storage main.cpp)
+add_executable(my_storage main.cpp src/crc32.cpp)
 target_link_libraries(my_storage Seastar::seastar)
